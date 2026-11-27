@@ -1,0 +1,114 @@
+"""Measure valid application submissions on a four-validator CometBFT testnet."""
+
+import argparse
+import csv
+import json
+import platform
+import random
+import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from itertools import product
+from pathlib import Path
+
+from run_valid_cases import (
+    ARTIFACT, POLICIES, Cluster, OpenSSLEd25519, Producer, commits, deploy,
+    diagnostic, optimistic, sha, state, version,
+)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--comet", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    binary = args.comet.resolve()
+    release = subprocess.check_output([str(binary), "version"], text=True).strip()
+    if release != "0.38.26":
+        raise ValueError(f"Unexpected CometBFT release: {release}")
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    (output / "environment.json").write_text(json.dumps({
+        "engine": release, "executable_sha256": sha(binary),
+        "openssl": version(0).decode(), "platform": platform.platform(),
+        "source_sha256": {
+            p.name: sha(p) for p in (
+                Path(__file__), Path(__file__).with_name("run_valid_cases.py"),
+                ARTIFACT / "deployment/deploy.py",
+                ARTIFACT / "deployment/protocol.py",
+                ARTIFACT / "cometbft/abci_socket.py",
+                ARTIFACT / "cometbft/ledger.py",
+                ARTIFACT / "cometbft/run_comet.py",
+                ARTIFACT / "cometbft/commits.py",
+                ARTIFACT / "optimistic/scheduler.py",
+            )
+        },
+        "validators": 4, "rpc_slots": 4, "workers": [14, 42],
+        "batches": [1, 32, 128], "repetitions": 3,
+        "scope": "real local engine of four processes, valid batches, no injected faults",
+    }, indent=2) + "\n")
+    default_cohort = deploy.cohort
+
+    def select(policy, history, n, f, c):
+        if policy == "O-TBC":
+            return optimistic(history, n, f, c)
+        return default_cohort(policy, history, n, f, c)
+
+    commits.Ed25519PublicKey = OpenSSLEd25519
+    deploy.cohort = select
+    fields = (
+        "policy", "workers", "batch", "repeat", "jobs", "epochs", "checks",
+        "transaction_bytes", "request_build_ns", "certificate_build_ns",
+        "broadcast_to_all_applied_ns", "height", "round", "signers", "tx_hash",
+    )
+    try:
+        with (output / "trials.csv").open("w", newline="") as trial_file:
+            writer = csv.DictWriter(trial_file, fieldnames=fields)
+            writer.writeheader()
+            for n, (policy, scheduler) in product((14, 42), POLICIES.items()):
+                mode = "direct" if policy == "local" else "certificate"
+                cap = n - 1 if policy in {"local", "direct_majority"} else n // 2 + 1
+                with tempfile.TemporaryDirectory(prefix="otbc-matrix-") as directory:
+                    home = Path(directory)
+                    try:
+                        with Producer(n, mode, cap, home / "producer") as producer:
+                            producer.pool.shutdown()
+                            producer.pool = ThreadPoolExecutor(max_workers=4)
+                            with Cluster(binary, home / "cluster", 4, producer.config, 45) as cluster:
+                                previous = state(cluster.nodes[0]["rpc"])
+                                proposal, _ = producer.make(previous, 1, scheduler, "honest")
+                                assert cluster.submit(proposal, previous, home / "warmup")["outcome"] == "finalized"
+                                trials = list(product((1, 32, 128), range(1, 4)))
+                                random.Random(20261126).shuffle(trials)
+                                for batch, rep in trials:
+                                    previous = state(cluster.nodes[0]["rpc"])
+                                    proposal, work = producer.make(previous, batch, scheduler, "honest")
+                                    pending = home / f"trial-{batch}-{rep}"
+                                    result = cluster.submit(proposal, previous, pending)
+                                    assert result["outcome"] == "finalized" and result["signers"] >= 3
+                                    if policy == "O-TBC":
+                                        assert (work["jobs"], work["epochs"]) == (n // 2, 1)
+                                    record = {
+                                        "policy": policy, "workers": n, "batch": batch, "repeat": rep,
+                                        "jobs": work["jobs"], "epochs": work["epochs"], "checks": work["checks"],
+                                        "transaction_bytes": len(proposal),
+                                        "request_build_ns": work["client_build_ns"],
+                                        "certificate_build_ns": work["produce_ns"],
+                                        "broadcast_to_all_applied_ns": result["finality_ns"],
+                                        **{key: result[key] for key in ("height", "round", "signers", "tx_hash")},
+                                    }
+                                    writer.writerow(record)
+                                    trial_file.flush()
+                                    check = json.loads((pending / "verified.json").read_text())
+                                    check["record"] = record
+                                    check["raw_evidence_sha256"] = {p.name: sha(p) for p in pending.glob("*.json")}
+                                    (output / f"{n}-{policy}-{batch}-{rep}.json").write_text(json.dumps(check, indent=2))
+                    except Exception:
+                        diagnostic(home, output, f"{policy}-{n}")
+                        raise
+    finally:
+        deploy.cohort = default_cohort
+
+
+if __name__ == "__main__":
+    main()

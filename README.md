@@ -51,3 +51,14 @@ The mobility and admission drivers carry the worker snapshots used in their resp
     python engine/run_engine_profile.py --comet "$COMET" --output outputs/comet-profile
 
 The testnet launches four validators with separate ABCI applications. The matrix records worker preparation, application completion, transaction size and commit verification for valid batches. The full-cost driver also records process CPU time. Use a fresh output directory for each deployment run.
+
+## Timed admission, two-site verification, and certificate costs
+
+The [concurrent admission experiments](artifact/concurrent_admission/README.md) measure signed tickets, durable issuance and consumption, gate-on and gate-off timing, and restart and deadline checks. The cap is per attempt and epoch. The loopback deployment uses a shared monotonic clock.
+
+The [two-site experiments](artifact/distributed/README.md) run registered workers across two Linux hosts. A remote consumer verifies complete signed transcripts in both placement arms. This service uses a separate report and closure path without the ticket gate.
+
+    python scientific_audit/otbc_certificate_cost.py --output outputs/certificates --blocks 10
+    python scientific_audit/otbc_retained_fanout.py --traces outputs/certificates --output outputs/fanout-otbc
+
+The certificate experiment generates positive one-, two-, and four-epoch traces and full reject evidence. It meters full and compact decoding and direct verification on paired inputs. The second command launches actual local consumer processes for selected traces. Figure and reanalysis programs take recorded run directories as inputs and write regenerated summaries locally.
